@@ -95,10 +95,10 @@ HEADERS_BASE = {
     # 此处无需（也不应）手动设置 content-type，否则与 requests 默认行为重复。
 }
 PAYLOAD = {"token": "glados.cloud"}
-TIMEOUT = (5, 15)  # (连接超时, 读取超时)
-MAX_RETRY = 3
+TIMEOUT = (10, 30)  # (连接超时, 读取超时)：海外 CI 访问 glados.cloud 偶发慢响应，15s 偏紧
+MAX_RETRY = 5       # 单次请求最多重试 5 次（共 6 次尝试），应对晚高峰抖动
 RETRY_MIN_WAIT = 2.0
-RETRY_MAX_WAIT = 10.0
+RETRY_MAX_WAIT = 30.0
 MIN_DELAY = 1.0
 MAX_DELAY = 2.0
 TELEGRAM_MAX_LENGTH = 4000
