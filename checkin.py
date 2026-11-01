@@ -30,14 +30,67 @@ CHECKIN_URL = "https://glados.cloud/api/user/checkin"
 STATUS_URL = "https://glados.cloud/api/user/status"
 POINTS_URL = "https://glados.cloud/api/user/points"
 EXCHANGE_URL = "https://glados.cloud/api/user/exchange"
-HEADERS_BASE = {
-    "origin": "https://glados.cloud",
-    "referer": "https://glados.cloud/console/checkin",
-    "user-agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+# GLaDOS 2026-09 起在签到接口新增「登录设备校验」：请求 UA 的平台必须与
+# 生成当前会话的登录设备平台一致，否则返回 code=4 且 message 为
+# "Automated check-in detected. Please sign in again to continue."（reason=device-mismatch）。
+# 因此 UA 不再写死：优先读环境变量 GLADOS_USER_AGENT，未配置时按平台自动切换。
+PLATFORM_UA = {
+    "Windows": DEFAULT_USER_AGENT,
+    "macOS": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     ),
+    "Linux": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "iPhone": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+        "Version/16.0 Mobile/15E148 Safari/604.1"
+    ),
+    "iPad": (
+        "Mozilla/5.0 (iPad; CPU OS 16_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+        "Version/16.0 Mobile/15E148 Safari/604.1"
+    ),
+    "Android": (
+        "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Mobile Safari/537.36"
+    ),
+}
+DEVICE_MISMATCH_CODE = 4
+
+
+def _normalize_ua(value: str) -> str:
+    """归一化 UA：折叠换行/多余空白（Secrets 里的多行粘贴会带尾随换行）。"""
+    return " ".join((value or "").split())
+
+
+def resolve_user_agent() -> str:
+    """
+    解析本次运行使用的 User-Agent。
+
+    优先级：环境变量 GLADOS_USER_AGENT > 内置默认 UA（Windows Chrome）。
+    配置 GLADOS_USER_AGENT 可让请求 UA 与「登录过 glados.cloud 的那台设备」完全一致，
+    从而通过服务端的设备校验；未配置时仍可在 code=4 时自动切换平台 UA 重试。
+    """
+    configured = _normalize_ua(os.getenv("GLADOS_USER_AGENT", ""))
+    return configured or DEFAULT_USER_AGENT
+
+
+HEADERS_BASE = {
+    "origin": "https://glados.cloud",
+    "referer": "https://glados.cloud/console/checkin",
+    "user-agent": resolve_user_agent(),
     # 注意：使用 requests 的 json= 参数时会自动设置 Content-Type: application/json，
     # 此处无需（也不应）手动设置 content-type，否则与 requests 默认行为重复。
 }
@@ -565,6 +618,50 @@ def push_all(title: str, content: str) -> Tuple[int, int]:
 
 
 # ==================== 签到逻辑 ====================
+def to_int(value: Any, default: int = -2) -> int:
+    """宽松转 int（服务端 code 偶尔以字符串返回）。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def is_device_mismatch(payload: Dict[str, Any]) -> bool:
+    """
+    判断是否为「设备平台校验」拦截（GLaDOS 2026-09 新增风控）。
+
+    典型响应: {"code": 4, "reason": "device-mismatch", "loginDevice": "macOS",
+               "message": "Automated check-in detected. Please sign in again to continue."}
+    注意：该拦截发生在签到幂等判断之前，所以「今天已签到」的账号也可能先撞到这里。
+    """
+    if to_int(payload.get("code")) != DEVICE_MISMATCH_CODE:
+        return False
+    reason = str(payload.get("reason") or "").lower()
+    if reason == "device-mismatch":
+        return True
+    # 兜底：老版本响应可能不带 reason，仅凭固定文案识别
+    message = str(payload.get("message") or "").lower()
+    return "automated check-in detected" in message
+
+
+def know_platform(ua: str) -> str:
+    """从 UA 粗判平台（仅用于日志，说明当前请求伪装成什么设备）。"""
+    ua = ua or ""
+    if "iPhone" in ua:
+        return "iPhone"
+    if "iPad" in ua:
+        return "iPad"
+    if "Android" in ua:
+        return "Android"
+    if "Macintosh" in ua or "Mac OS X" in ua:
+        return "macOS"
+    if "Windows" in ua:
+        return "Windows"
+    if "Linux" in ua:
+        return "Linux"
+    return "未知"
+
+
 def classify_checkin(code: Any, message: str) -> str:
     """
     判断签到结果: ok / repeat / fail
@@ -643,8 +740,27 @@ def checkin_account(
     exchange_status = "-"  # 兑换结果描述（未配置时保持 "-"，不输出到日志）
 
     try:
-        # 1. 签到
+        # 1. 签到（含「设备平台校验」自适应）
+        #    GLaDOS 2026-09 起，签到接口会校验「请求 UA 平台 == 生成会话的登录设备平台」，
+        #    不一致时返回 code=4 (reason=device-mismatch)。该拦截发生在「今天是否已签到」判断之前，
+        #    所以当天已签到的账号也会先看到 "Automated check-in detected"。
+        #    处理方式：读取服务端返回的 loginDevice，切换到对应平台 UA 自动重试一次。
         j = checkin_request(session, headers)
+        if is_device_mismatch(j):
+            login_device = str(j.get("loginDevice") or "")
+            recover_ua = PLATFORM_UA.get(login_device)
+            current_ua = headers.get("user-agent", "")
+            if recover_ua and recover_ua != current_ua:
+                logger.warning(
+                    "账号 %d 设备平台不匹配 (loginDevice=%s, 当前UA平台=%s)，切换 UA 重试一次",
+                    index, login_device or "未知", know_platform(current_ua),
+                )
+                headers["user-agent"] = recover_ua
+                # 同步回全局：后续账号直接复用已学到的平台，不做无效重试
+                HEADERS_BASE["user-agent"] = recover_ua
+                time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+                j = checkin_request(session, headers)
+
         code = j.get("code", -2)
         message = j.get("message", "")
         # H1：GLaDOS 不返回 points 字段，从 message 文本解析本次获得积分
@@ -655,6 +771,16 @@ def checkin_account(
             status = f"✅ 成功 (+{earned}积分)"
         elif result == "repeat":
             status = "🔄 已签到"
+        elif is_device_mismatch(j):
+            # 自适应重试后仍被拦：登录设备不在映射表内，或 Cookie 与 UA 来自不同设备
+            login_device = j.get("loginDevice") or "未知"
+            status = f"❌ 设备校验失败(登录设备={login_device}) → 请配置 GLADOS_USER_AGENT"
+            logger.error(
+                "账号 %d 设备校验未通过 (loginDevice=%s, reason=%s)："
+                "请把登录过 glados.cloud 的那台设备的完整 User-Agent 配置为 "
+                "GLADOS_USER_AGENT 后重试",
+                index, login_device, j.get("reason") or "-",
+            )
         else:
             # 区分「服务端鉴权失败」与「其它业务失败」：鉴权失败通常是 Cookie 过期/
             # 复制不完整，需要给出「重新获取 Cookie」的可操作提示，避免与格式问题混淆。
@@ -769,6 +895,11 @@ def main() -> int:
         return 1  # L4：配置缺失视为失败，避免 CI 误标绿
 
     logger.info("检测到 %d 个账号", len(cookies))
+    logger.info(
+        "请求 UA 平台: %s（%s）",
+        know_platform(HEADERS_BASE["user-agent"]),
+        "来自 GLADOS_USER_AGENT" if _normalize_ua(os.getenv("GLADOS_USER_AGENT", "")) else "内置默认，遇到设备校验会自动切换",
+    )
 
     ok = fail = repeat = 0
     lines = []

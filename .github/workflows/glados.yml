@@ -34,6 +34,9 @@ jobs:
         run: python checkin.py
         env:
           COOKIES: ${{ secrets.COOKIES || vars.COOKIES }}
+          # 设备校验：填「登录过 glados.cloud 的那台设备」的完整 User-Agent。
+          # 不填也能跑——脚本会在被设备校验拦截时按 loginDevice 自动切换 UA 重试。
+          GLADOS_USER_AGENT: ${{ secrets.GLADOS_USER_AGENT || vars.GLADOS_USER_AGENT }}
           SENDKEY: ${{ secrets.SENDKEY }}
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}

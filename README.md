@@ -15,6 +15,7 @@
 - 🔄 网络请求自动重试（指数退避）
 - 🔒 日志脱敏（邮箱/Cookie 自动隐藏）
 - ✅ Cookie 结构预验证（前缀无关，自动兼容 `koa:` / `gld:` 等任意前缀）
+- 🖥️ 登录设备校验自适应（`code=4` / `device-mismatch` 按 `loginDevice` 自动切换 UA 重试）
 - 🔧 每月自动空提交保活
 - 💎 积分自动兑换（可选，消耗积分兑换会员天数）
 - 🆓 完全免费
@@ -76,6 +77,30 @@ gld:sess=xxxxxx; gld:sess.sig=yyyyyy
 
 ⚠️ **必须填在 Secrets，不是 Variables。** 填错位置脚本会读不到值，直接报
 `未检测到 COOKIES`。变量名必须是 `COOKIES`，不能有多余空格。
+
+#### 3.1（可选）配置 `GLADOS_USER_AGENT` 通过设备校验
+
+GLaDOS 在 2026 年 9 月的新版认证里增加了**登录设备校验**：签到请求的 `User-Agent`
+平台必须与生成当前 Cookie 的那台设备一致，否则服务端返回
+`code=4 / reason=device-mismatch`，日志表现为：
+
+```
+❌ 失败(Automated check-in detected. Please sign in again to continue.)
+```
+
+> 这种情况**不是** Cookie 失效，也**不是**「今天已签到」——同一次运行里
+> `总积分 / 剩余天数` 仍能正常查到，就说明鉴权是通的。
+
+脚本已内置**自适应**：首次被拦时会读取响应里的 `loginDevice`，自动切换到对应平台
+（Windows / macOS / Linux / iPhone / iPad / Android）的 UA 重试一次，**通常无需任何配置**。
+
+若自动切换后仍失败（例如登录设备不在上述平台，或想完全对齐），再手动配置：
+
+1. 在**同一个浏览器**打开 `chrome://version`，复制「用户代理」整行内容
+2. **Settings** → **Secrets and variables** → **Actions** 新增 Secret `GLADOS_USER_AGENT`
+3. 值填刚才复制的完整 UA（也可放在 Variables 里，脚本两处都会读）
+
+配置后优先级最高，脚本不再猜平台。浏览器大版本升级后建议重新登录并同步更新 UA 与 Cookie。
 
 ---
 
@@ -161,6 +186,23 @@ A: 说明 Cookie 已失效或复制不完整，**请重新登录 GLaDOS 获取�
 
 > 💡 脚本会自动识别 `koa:` / `gld:` 等任意前缀，**无需手动修改前缀**；反之，手动把前缀改错（如把 `gld:` 改成 `koa:`）会让服务端无法识别 session。
 
+**Q: 签到失败提示 `Automated check-in detected. Please sign in again to continue.`？**
+
+A: 这是 GLaDOS 2026-09 新增的**登录设备校验**（服务端返回 `code=4, reason=device-mismatch`），
+不是 Cookie 失效。判断方法：同一次运行的日志里「总积分 / 剩余天数」能正常查到，就说明鉴权是通的。
+
+处理顺序：
+
+1. 看日志里是否有 `设备平台不匹配 (loginDevice=xxx)，切换 UA 重试一次` —— 有的话说明自适应已生效，
+   重试结果就是最终结果；
+2. 若最终仍报 `设备校验失败`，说明登录设备不在内置映射表内：把**登录过 glados.cloud 的那台设备**的
+   完整 User-Agent 配置到 `GLADOS_USER_AGENT`（见[第三步 3.1](#31可选配置-glados_user_agent-通过设备校验)）；
+3. 还是不行，就回到同一个浏览器重新登录、重新复制完整 Cookie，让 Cookie 与 UA 同源。
+
+> ⚠️ 该拦截发生在「今天是否已签到」判断**之前**，所以当天已经签到过的账号也可能先看到这句报错。
+> 修好 UA 后重跑，若当天确实已签到，会正常显示 `🔄 已签到`。
+> 另外**不要反复重跑**：同一账号短时间内多次被判定为自动化请求，风控标记只会更重。
+
 **Q: Cookie 有有效期吗？**
 
 A: 有。Cookie 会随会话过期，需重新登录获取最新 Cookie 并更新 Secrets。
@@ -180,6 +222,25 @@ A: 可以，配置多个 Secrets 即可同时推送。
 ---
 
 ## 🔄 更新日志
+
+### v2.1.2
+
+**问题修复**
+
+- 修复 GLaDOS 2026-09 新增的**登录设备校验**导致签到失败：签到接口原先固定使用 Windows Chrome UA，
+  若 Cookie 来自 macOS / iPhone / Android 等设备，服务端会返回 `code=4`（`reason=device-mismatch`），
+  日志表现为 `❌ 失败(Automated check-in detected. Please sign in again to continue.)`，
+  即使 Cookie 完全有效、当天尚未签到也无法通过
+
+**优化改进**
+
+- User-Agent 不再写死：新增 `GLADOS_USER_AGENT` 环境变量（Secrets / Variables 均可），优先级最高
+- 新增**设备平台自适应**：被 `device-mismatch` 拦截时，读取服务端返回的 `loginDevice`，
+  自动切换到对应平台（Windows / macOS / Linux / iPhone / iPad / Android）的 UA 重试一次，
+  学到的平台会缓存给同一次运行中的后续账号，避免重复踩坑
+- 签到失败诊断细化：`code=4` 不再显示笼统的原始英文文案，而是直接给出「登录设备 + 应配置的变量名」
+- 启动时打印本次使用的 UA 平台，便于一眼确认请求伪装成什么设备
+- README 新增设备校验专题说明与常见问题条目
 
 ### v2.1.1
 
