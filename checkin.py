@@ -954,6 +954,22 @@ def main() -> int:
     logger.info("%s", content)
     logger.info("%s", "=" * 50)
 
+    # 定时冗余调度下的「已签到静默」：工作流排了多个 cron 做兜底，后几次必然命中
+    # 「已签到」；若照常推送，一天会收到多张卡片。因此定时运行在「全部账号已签到且无失败」
+    # 时跳过推送；手动触发（workflow_dispatch）仍照常推送，便于随时验证推送链路。
+    # 需要恢复「每次都推送」时设置 PUSH_ON_REPEAT=1 即可。
+    event_name = str(os.getenv("GLADOS_EVENT_NAME", "")).strip().lower()
+    force_push = str(os.getenv("PUSH_ON_REPEAT", "")).strip().lower() in ("1", "true", "yes", "on")
+    if (
+        not force_push
+        and event_name != "workflow_dispatch"
+        and len(cookies) > 0
+        and fail == 0
+        and repeat == len(cookies)
+    ):
+        logger.info("全部账号今日已签到，本次跳过推送（设置 PUSH_ON_REPEAT=1 可恢复每次推送）")
+        return 0
+
     pushed_success, pushed_configured = push_all(title, content)
 
     # L4：区分"业务失败"与"通知发送失败"，必要时非零退出避免误判成功

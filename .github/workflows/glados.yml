@@ -3,8 +3,13 @@ name: GLaDOS Auto Checkin
 on:
   workflow_dispatch:  # 手动触发
   schedule:
-    - cron: '0 4 * * *'   # 每日 UTC 4 点签到（北京时间 12 点）
-    - cron: '0 0 1 * *'   # 每月 1 号保活空提交
+    # GitHub 的 schedule 是「尽力而为」：整点最拥堵，可能延迟数小时甚至被丢弃。
+    # 因此错开分钟（避开 :00），并排三次做冗余：任一次命中即可完成签到，
+    # 后续几次命中「已签到」时脚本会自动静默，不会重复推送。
+    - cron: '7 4 * * *'    # 主时段：北京时间 12:07
+    - cron: '23 6 * * *'   # 兜底 1：北京时间 14:23
+    - cron: '41 8 * * *'   # 兜底 2：北京时间 16:41
+    - cron: '0 0 1 * *'    # 每月 1 号保活空提交
 
 jobs:
   checkin:
@@ -37,6 +42,8 @@ jobs:
           # 设备校验：填「登录过 glados.cloud 的那台设备」的完整 User-Agent。
           # 不填也能跑——脚本会在被设备校验拦截时按 loginDevice 自动切换 UA 重试。
           GLADOS_USER_AGENT: ${{ secrets.GLADOS_USER_AGENT || vars.GLADOS_USER_AGENT }}
+          # 触发来源：定时冗余调度时用于「全部已签到则静默」，手动触发仍照常推送
+          GLADOS_EVENT_NAME: ${{ github.event_name }}
           SENDKEY: ${{ secrets.SENDKEY }}
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
